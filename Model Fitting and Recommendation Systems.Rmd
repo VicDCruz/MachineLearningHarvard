@@ -1,0 +1,494 @@
+# Model Fitting and Recommendation Systems
+
+Initial data
+```{r}
+library(dslabs)
+mnist <- read_mnist()
+class(mnist$train$labels)
+table(mnist$train$labels)
+```
+
+Sample 10k rows
+```{r}
+set.seed(123)
+index <- sample(nrow(mnist$train$images), 10000)
+x <- mnist$train$images[index,]
+y <- factor(mnist$train$labels[index])
+
+index <- sample(nrow(mnist$test$images), 1000)
+#note that the line above is the corrected code - code in video at 0:52 is incorrect
+x_test <- mnist$test$images[index,]
+y_test <- factor(mnist$test$labels[index])
+```
+
+## Pre-processing
+We don't need a 0 variation feature
+
+```{r}
+library(matrixStats)
+library(tidyverse)
+library(caret)
+library(dslabs)
+sds <- colSds(x)
+qplot(sds, bins = 256)
+
+library(caret)
+nzv <- nearZeroVar(x)
+image(matrix(1:784 %in% nzv, 28, 28))
+
+col_index <- setdiff(1:ncol(x), nzv)
+length(col_index)
+```
+
+Remember, we are looking at pixels!
+
+## Model Fitting for MNIST Data
+
+Add name to columns
+```{r}
+colnames(x) <- 1:ncol(mnist$train$images)
+colnames(x_test) <- colnames(x)
+
+control <- trainControl(method = "cv", number = 10, p = .9)
+train_knn <- train(x[,col_index], y,
+                                method = "knn", 
+                                tuneGrid = data.frame(k = c(1,3,5,7)),
+                                trControl = control)
+ggplot(train_knn)
+```
+
+
+Use KNN & select the best K
+```{r}
+n <- 1000
+b <- 2
+index <- sample(nrow(x), n)
+control <- trainControl(method = "cv", number = b, p = .9)
+train_knn <- train(x[index ,col_index], y[index],
+                   method = "knn",
+                   tuneGrid = data.frame(k = c(3,5,7)),
+                   trControl = control)
+fit_knn <- knn3(x[ ,col_index], y,  k = 3)
+
+y_hat_knn <- predict(fit_knn,
+                     x_test[, col_index],
+                     type="class")
+cm <- confusionMatrix(y_hat_knn, factor(y_test))
+cm$overall["Accuracy"]
+
+cm$byClass[,1:2]
+```
+
+Now, let's create forests of trees
+```{r}
+library(Rborist)
+control <- trainControl(method="cv", number = 5, p = 0.8)
+grid <- expand.grid(minNode = c(1,5) , predFixed = c(10, 15, 25, 35, 50))
+train_rf <-  train(x[, col_index], y,
+                   method = "Rborist",
+                   nTree = 50,
+                   trControl = control,
+                   tuneGrid = grid,
+                   nSamp = 5000)
+ggplot(train_rf)
+train_rf$bestTune
+```
+
+Tunning parameters
+```{r}
+fit_rf <- Rborist(x[, col_index], y,
+                  nTree = 1000,
+                  minNode = train_rf$bestTune$minNode,
+                  predFixed = train_rf$bestTune$predFixed)
+
+y_hat_rf <- factor(levels(y)[predict(fit_rf, x_test[ ,col_index])$yPred])
+cm <- confusionMatrix(y_hat_rf, y_test)
+cm$overall["Accuracy"]
+
+rafalib::mypar(3,4)
+for(i in 1:12){
+     image(matrix(x_test[i,], 28, 28)[, 28:1], 
+           main = paste("Our prediction:", y_hat_rf[i]),
+           xaxt="n", yaxt="n")
+}
+```
+
+## Variable importance
+
+Lookinf at importance
+```{r}
+library(randomForest)
+x <- mnist$train$images[index,]
+y <- factor(mnist$train$labels[index])
+rf <- randomForest(x, y,  ntree = 50)
+imp <- importance(rf)
+imp
+
+image(matrix(imp, 28, 28))
+```
+There are many pixels that are not used, the yellow parts are the unused. We need to get rid of them
+
+Now, let's see for our errors. 
+
+```{r}
+p_max <- predict(fit_knn, x_test[,col_index])
+p_max <- apply(p_max, 1, max)
+ind  <- which(y_hat_knn != y_test)
+ind <- ind[order(p_max[ind], decreasing = TRUE)]
+rafalib::mypar(3,4)
+for(i in ind[1:12]){
+    image(matrix(x_test[i,], 28, 28)[, 28:1],
+                 main = paste0("Pr(",y_hat_knn[i],")=",round(p_max[i], 2),
+                                                                        " but is a ",y_test[i]),
+                 xaxt="n", yaxt="n")
+}
+```
+
+The same for the random forests
+```{r}
+p_max <- predict(fit_rf, x_test[,col_index])$census  
+p_max <- p_max / rowSums(p_max)
+p_max <- apply(p_max, 1, max)
+ind  <- which(y_hat_rf != y_test)
+ind <- ind[order(p_max[ind], decreasing = TRUE)]
+rafalib::mypar(3,4)
+for(i in ind[1:12]){
+    image(matrix(x_test[i,], 28, 28)[, 28:1], 
+                 main = paste0("Pr(",y_hat_rf[i],")=",round(p_max[i], 2),
+                               " but is a ",y_test[i]),
+                 xaxt="n", yaxt="n")
+}
+```
+
+## Ensambles
+Using different methods to improve predictions
+
+```{r}
+p_rf <- predict(fit_rf, x_test[,col_index])$census
+p_rf <- p_rf / rowSums(p_rf)
+p_knn <- predict(fit_knn, x_test[,col_index])
+p <- (p_rf + p_knn)/2
+y_pred <- factor(apply(p, 1, which.max)-1)
+confusionMatrix(y_pred, y_test)
+```
+## Recommendation Systems
+
+Initial data
+```{r}
+library(dslabs)
+library(tidyverse)
+data("movielens")
+
+head(movielens)
+
+movielens %>%
+     summarize(n_users = n_distinct(userId),
+               n_movies = n_distinct(movieId))
+
+keep <- movielens %>%
+     dplyr::count(movieId) %>%
+     top_n(5) %>%
+     pull(movieId)
+tab <- movielens %>%
+     filter(userId %in% c(13:20)) %>% 
+     filter(movieId %in% keep) %>% 
+     select(userId, title, rating) %>% 
+     spread(title, rating)
+tab %>% knitr::kable()
+```
+
+User vs Movies
+```{r}
+users <- sample(unique(movielens$userId), 100)
+rafalib::mypar()
+movielens %>% filter(userId %in% users) %>% 
+     select(userId, movieId, rating) %>%
+     mutate(rating = 1) %>%
+     spread(movieId, rating) %>% select(sample(ncol(.), 100)) %>% 
+     as.matrix() %>% t(.) %>%
+     image(1:100, 1:100,. , xlab="Movies", ylab="Users")
+abline(h=0:100+0.5, v=0:100+0.5, col = "grey")
+```
+
+Movies rated
+```{r}
+movielens %>% 
+     dplyr::count(movieId) %>% 
+     ggplot(aes(n)) + 
+     geom_histogram(bins = 30, color = "black") + 
+     scale_x_log10() + 
+     ggtitle("Movies")
+```
+
+Users that rate
+```{r}
+movielens %>%
+     dplyr::count(userId) %>% 
+     ggplot(aes(n)) + 
+     geom_histogram(bins = 30, color = "black") + 
+     scale_x_log10() +
+     ggtitle("Users")
+```
+
+Create partition & RMSE function
+```{r}
+library(caret)
+set.seed(755)
+test_index <- createDataPartition(y = movielens$rating, times = 1,
+                                  p = 0.2, list = FALSE)
+train_set <- movielens[-test_index,]
+test_set <- movielens[test_index,]
+
+test_set <- test_set %>% 
+     semi_join(train_set, by = "movieId") %>%
+     semi_join(train_set, by = "userId")
+
+RMSE <- function(true_ratings, predicted_ratings){
+     sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## Building the Recommendation System
+
+Y(u,i) = mu + bi + bu + epsilon(u, i)
+
+```{r}
+mu_hat <- mean(train_set$rating)
+mu_hat
+
+naive_rmse <- RMSE(test_set$rating, mu_hat)
+naive_rmse
+
+predictions <- rep(2.5, nrow(test_set))
+RMSE(test_set$rating, predictions)
+
+rmse_results <- data_frame(method = "Just the average", RMSE = naive_rmse)
+```
+
+Now, create the model
+```{r}
+fit <- lm(rating ~ as.factor(userId), data = movielens)
+mu <- mean(train_set$rating) 
+movie_avgs <- train_set %>% 
+     group_by(movieId) %>% 
+     summarize(b_i = mean(rating - mu))
+
+movie_avgs %>% qplot(b_i, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+predicted_ratings <- mu + test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+     .$b_i
+
+model_1_rmse <- RMSE(predicted_ratings, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+
+rmse_results %>% knitr::kable()
+
+train_set %>% 
+     group_by(userId) %>% 
+     summarize(b_u = mean(rating)) %>% 
+     filter(n()>=100) %>%
+     ggplot(aes(b_u)) + 
+     geom_histogram(bins = 30, color = "black")
+```
+
+We can use this: lm(rating ~ as.factor(movieId) + as.factor(userId))
+For have a dependencie for Movies & Users, but this may crash our computer
+
+Instead, we are going to:
+```{r}
+user_avgs <- test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+     group_by(userId) %>%
+     summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings <- test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+     left_join(user_avgs, by='userId') %>%
+     mutate(pred = mu + b_i + b_u) %>%
+     .$pred
+
+model_2_rmse <- RMSE(predicted_ratings, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User Effects Model",  
+                                     RMSE = model_2_rmse ))
+rmse_results %>% knitr::kable()
+```
+
+## Regularization
+
+Penalty to low critics & very bad or good critics
+```{r}
+library(dslabs)
+library(tidyverse)
+library(caret)
+data("movielens")
+set.seed(755)
+test_index <- createDataPartition(y = movielens$rating, times = 1,
+                                  p = 0.2, list = FALSE)
+train_set <- movielens[-test_index,]
+test_set <- movielens[test_index,]
+test_set <- test_set %>% 
+     semi_join(train_set, by = "movieId") %>%
+     semi_join(train_set, by = "userId")
+RMSE <- function(true_ratings, predicted_ratings){
+     sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+mu_hat <- mean(train_set$rating)
+naive_rmse <- RMSE(test_set$rating, mu_hat)
+rmse_results <- data_frame(method = "Just the average", RMSE = naive_rmse)
+mu <- mean(train_set$rating) 
+movie_avgs <- train_set %>% 
+     group_by(movieId) %>% 
+     summarize(b_i = mean(rating - mu))
+predicted_ratings <- mu + test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+     .$b_i
+model_1_rmse <- RMSE(predicted_ratings, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie Effect Model",
+                                     RMSE = model_1_rmse ))
+user_avgs <- test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+     group_by(userId) %>%
+     summarize(b_u = mean(rating - mu - b_i))
+predicted_ratings <- test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+>     left_join(user_avgs, by='userId') %>%
+     mutate(pred = mu + b_i + b_u) %>%
+     .$pred
+model_2_rmse <- RMSE(predicted_ratings, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User Effects Model",  
+                                     RMSE = model_2_rmse ))
+
+test_set %>% 
+     left_join(movie_avgs, by='movieId') %>%
+     mutate(residual = rating - (mu + b_i)) %>%
+     arrange(desc(abs(residual))) %>% 
+     select(title,  residual) %>% slice(1:10) %>% knitr::kable()
+
+movie_titles <- movielens %>% 
+     select(movieId, title) %>%
+     distinct()
+movie_avgs %>% left_join(movie_titles, by="movieId") %>%
+     arrange(desc(b_i)) %>% 
+     select(title, b_i) %>% 
+     slice(1:10) %>%  
+     knitr::kable()
+
+movie_avgs %>% left_join(movie_titles, by="movieId") %>%
+     arrange(b_i) %>% 
+     select(title, b_i) %>% 
+     slice(1:10) %>%  
+     knitr::kable()
+
+train_set %>% dplyr::count(movieId) %>% 
+     left_join(movie_avgs) %>%
+     left_join(movie_titles, by="movieId") %>%
+     arrange(desc(b_i)) %>% 
+     select(title, b_i, n) %>% 
+     slice(1:10) %>% 
+     knitr::kable()
+
+train_set %>% dplyr::count(movieId) %>% 
+     left_join(movie_avgs) %>%
+     left_join(movie_titles, by="movieId") %>%
+     arrange(b_i) %>% 
+     select(title, b_i, n) %>% 
+     slice(1:10) %>% 
+     knitr::kable()
+lambda <- 3
+mu <- mean(train_set$rating)
+movie_reg_avgs <- train_set %>% 
+     group_by(movieId) %>% 
+     summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n()) 
+
+data_frame(original = movie_avgs$b_i, 
+           regularlized = movie_reg_avgs$b_i, 
+           n = movie_reg_avgs$n_i) %>%
+     ggplot(aes(original, regularlized, size=sqrt(n))) + 
+     geom_point(shape=1, alpha=0.5)
+
+train_set %>%
+     dplyr::count(movieId) %>% 
+     left_join(movie_reg_avgs) %>%
+     left_join(movie_titles, by="movieId") %>%
+     arrange(desc(b_i)) %>% 
+     select(title, b_i, n) %>% 
+     slice(1:10) %>% 
+     knitr::kable()
+
+train_set %>%
+     dplyr::count(movieId) %>% 
+     left_join(movie_reg_avgs) %>%
+     left_join(movie_titles, by="movieId") %>%
+     arrange(b_i) %>% 
+     select(title, b_i, n) %>% 
+     slice(1:10) %>% 
+     knitr::kable()
+
+predicted_ratings <- test_set %>% 
+     left_join(movie_reg_avgs, by='movieId') %>%
+     mutate(pred = mu + b_i) %>%
+     .$pred
+
+model_3_rmse <- RMSE(predicted_ratings, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie Effect Model",  
+                                     RMSE = model_3_rmse ))
+rmse_results %>% knitr::kable()
+
+lambdas <- seq(0, 10, 0.25)
+mu <- mean(train_set$rating)
+just_the_sum <- train_set %>% 
+     group_by(movieId) %>% 
+     summarize(s = sum(rating - mu), n_i = n())
+rmses <- sapply(lambdas, function(l){
+     predicted_ratings <- test_set %>% 
+          left_join(just_the_sum, by='movieId') %>% 
+          mutate(b_i = s/(n_i+l)) %>%
+          mutate(pred = mu + b_i) %>%
+          .$pred
+     return(RMSE(predicted_ratings, test_set$rating))
+})
+qplot(lambdas, rmses)  
+lambdas[which.min(rmses)]
+
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+     mu <- mean(train_set$rating)
+     b_i <- train_set %>%
+          group_by(movieId) %>%
+          summarize(b_i = sum(rating - mu)/(n()+l))
+     b_u <- train_set %>% 
+          left_join(b_i, by="movieId") %>%
+          group_by(userId) %>%
+          summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+     predicted_ratings <- 
+          test_set %>% 
+          left_join(b_i, by = "movieId") %>%
+          left_join(b_u, by = "userId") %>%
+          mutate(pred = mu + b_i + b_u) %>%
+          .$pred
+     return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses)  
+
+lambda <- lambdas[which.min(rmses)]
+lambda
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie + User Effect Model",  
+                                     RMSE = min(rmses)))
+rmse_results %>% knitr::kable()
+```
+
+
+
+
+
+
